@@ -3,5 +3,6 @@ uvicorn[standard]
 ultralytics
 supabase
 python-dotenv
+python-multipart
 pillow
 numpy

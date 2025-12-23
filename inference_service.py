@@ -26,7 +26,8 @@ RUNS_TABLE = "training_runs"
 PREDICTIONS_TABLE = "predicted_annotations"
 STEP_IMAGES_TABLE = "step_images"
 
-load_dotenv()
+ENV_PATH = os.path.join(os.path.dirname(__file__), ".env.local")
+load_dotenv(ENV_PATH)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 if SUPABASE_URL and not SUPABASE_URL.endswith("/"):
