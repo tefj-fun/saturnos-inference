@@ -28,6 +28,7 @@ Common options:
 - `DEFAULT_MAX_DETECTIONS` (default `300`)
 - `MAX_IMAGE_BYTES` (default `10485760`)
 - `IMAGE_FETCH_TIMEOUT` (default `15`)
+- `HEARTBEAT_INTERVAL` (default `10`) to upsert worker status into `inference_workers`
 - `SAVE_PREDICTIONS` (default `0`) to store predictions in `predicted_annotations`
 - `ALLOW_NULL_STEP_IMAGE` (default `1`) to allow writes without a known `step_image_id`
 
@@ -37,6 +38,18 @@ Deployment registration (optional):
 - `POLL_DEPLOYMENTS` (default `1`)
 - `DEPLOYMENT_POLL_INTERVAL` (default `20`)
 - `OVERWRITE_DEPLOYMENT_URL` (default `0`)
+
+Worker metadata (optional, shown in Results & Analysis status panel):
+- `WORKER_ID` (default hostname)
+- `WORKER_DEVICE_TYPE`, `WORKER_COMPUTE_TYPE`
+- `WORKER_GPU_NAME`, `WORKER_GPU_MODEL`, `WORKER_GPU`
+- `WORKER_GPU_MEMORY_GB`, `WORKER_GPU_VRAM_GB`
+- `WORKER_GPU_MEMORY_MB`, `WORKER_GPU_VRAM_MB`
+- `WORKER_CPU_MODEL`, `WORKER_CPU`, `WORKER_RAM_GB`
+
+Supabase schema note:
+- Create `public.inference_workers` (see SaturnOS migration `0020_add_inference_workers.sql`)
+  to enable the worker heartbeat status panel in the UI.
 
 Triton (optional):
 - `INFERENCE_BACKEND=triton`

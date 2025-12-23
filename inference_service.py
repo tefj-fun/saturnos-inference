@@ -25,6 +25,7 @@ from ultralytics import YOLO
 RUNS_TABLE = "training_runs"
 PREDICTIONS_TABLE = "predicted_annotations"
 STEP_IMAGES_TABLE = "step_images"
+WORKERS_TABLE = "inference_workers"
 
 ENV_PATH = os.path.join(os.path.dirname(__file__), ".env.local")
 load_dotenv(ENV_PATH)
@@ -44,6 +45,7 @@ DEFAULT_MAX_DETECTIONS = int(os.getenv("DEFAULT_MAX_DETECTIONS", "300"))
 DEVICE = os.getenv("DEVICE", "0")
 MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_BYTES", str(10 * 1024 * 1024)))
 IMAGE_FETCH_TIMEOUT = int(os.getenv("IMAGE_FETCH_TIMEOUT", "15"))
+HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "10"))
 
 SAVE_PREDICTIONS = os.getenv("SAVE_PREDICTIONS", "0").lower() in ("1", "true", "yes")
 ALLOW_NULL_STEP_IMAGE = os.getenv("ALLOW_NULL_STEP_IMAGE", "1").lower() in ("1", "true", "yes")
@@ -64,6 +66,23 @@ TRITON_INPUT_FORMAT = os.getenv("TRITON_INPUT_FORMAT", "nhwc")
 TRITON_OUTPUT_FORMAT = os.getenv("TRITON_OUTPUT_FORMAT", "xyxy")
 
 WORKER_ID = os.getenv("WORKER_ID", socket.gethostname())
+WORKER_DEVICE_TYPE = os.getenv("WORKER_DEVICE_TYPE")
+WORKER_COMPUTE_TYPE = os.getenv("WORKER_COMPUTE_TYPE")
+WORKER_GPU_NAME = os.getenv("WORKER_GPU_NAME")
+WORKER_GPU_MODEL = os.getenv("WORKER_GPU_MODEL")
+WORKER_GPU = os.getenv("WORKER_GPU")
+WORKER_GPU_MEMORY_GB = os.getenv("WORKER_GPU_MEMORY_GB")
+WORKER_GPU_VRAM_GB = os.getenv("WORKER_GPU_VRAM_GB")
+WORKER_GPU_MEMORY_MB = os.getenv("WORKER_GPU_MEMORY_MB")
+WORKER_GPU_VRAM_MB = os.getenv("WORKER_GPU_VRAM_MB")
+WORKER_CPU_MODEL = os.getenv("WORKER_CPU_MODEL")
+WORKER_CPU = os.getenv("WORKER_CPU")
+WORKER_RAM_GB = os.getenv("WORKER_RAM_GB")
+
+WORKER_STATUS_LOCK = threading.Lock()
+ACTIVE_REQUESTS_LOCK = threading.Lock()
+WORKER_STATUS = "online"
+ACTIVE_REQUESTS = 0
 
 app = FastAPI(title="SaturnOS Inference Worker")
 
@@ -74,6 +93,93 @@ def utc_now() -> str:
 
 def log(message: str) -> None:
     print(f"[{utc_now()}] {message}", flush=True)
+
+
+def normalize_float_env(value: Optional[str]):
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def set_worker_status(status: str) -> None:
+    global WORKER_STATUS
+    with WORKER_STATUS_LOCK:
+        WORKER_STATUS = status
+
+
+def get_worker_status() -> str:
+    with WORKER_STATUS_LOCK:
+        return WORKER_STATUS
+
+
+def mark_request_start() -> None:
+    global ACTIVE_REQUESTS
+    with ACTIVE_REQUESTS_LOCK:
+        ACTIVE_REQUESTS += 1
+        set_worker_status("busy")
+
+
+def mark_request_end() -> None:
+    global ACTIVE_REQUESTS
+    with ACTIVE_REQUESTS_LOCK:
+        ACTIVE_REQUESTS = max(0, ACTIVE_REQUESTS - 1)
+        if ACTIVE_REQUESTS == 0:
+            set_worker_status("online")
+
+
+def build_worker_payload(status: Optional[str] = None) -> Dict[str, Any]:
+    payload = {
+        "worker_id": WORKER_ID,
+        "status": status or get_worker_status(),
+        "last_seen": utc_now(),
+    }
+    optional_fields = {
+        "device_type": WORKER_DEVICE_TYPE,
+        "compute_type": WORKER_COMPUTE_TYPE,
+        "gpu_name": WORKER_GPU_NAME,
+        "gpu_model": WORKER_GPU_MODEL,
+        "gpu": WORKER_GPU,
+        "cpu_model": WORKER_CPU_MODEL,
+        "cpu": WORKER_CPU,
+    }
+    for key, value in optional_fields.items():
+        if value:
+            payload[key] = value
+    numeric_fields = {
+        "gpu_memory_gb": normalize_float_env(WORKER_GPU_MEMORY_GB),
+        "gpu_vram_gb": normalize_float_env(WORKER_GPU_VRAM_GB),
+        "gpu_memory_mb": normalize_float_env(WORKER_GPU_MEMORY_MB),
+        "gpu_vram_mb": normalize_float_env(WORKER_GPU_VRAM_MB),
+        "ram_gb": normalize_float_env(WORKER_RAM_GB),
+    }
+    for key, value in numeric_fields.items():
+        if value is not None:
+            payload[key] = value
+    return payload
+
+
+def upsert_worker_heartbeat(supabase, status: Optional[str] = None) -> None:
+    payload = build_worker_payload(status)
+    supabase.table(WORKERS_TABLE).upsert(payload, on_conflict="worker_id").execute()
+
+
+def start_heartbeat_thread(supabase):
+    stop_event = threading.Event()
+
+    def loop():
+        while not stop_event.is_set():
+            try:
+                upsert_worker_heartbeat(supabase)
+            except Exception as exc:
+                log(f"Failed to update inference worker heartbeat: {exc}")
+            stop_event.wait(HEARTBEAT_INTERVAL)
+
+    thread = threading.Thread(target=loop, daemon=True)
+    thread.start()
+    return stop_event, thread
 
 
 def extract_storage_path(value: str):
@@ -546,28 +652,32 @@ async def predict(
         raise HTTPException(status_code=400, detail="No image provided.")
     if not step_image_id and image_url:
         step_image_id = lookup_step_image_id(supabase, image_url)
-    start = time.time()
-    model_cache = app.state.model_cache
+    mark_request_start()
     try:
-        predictions, raw_output = infer_backend(model_cache, supabase, run_id, image_array, options)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-    duration_ms = int((time.time() - start) * 1000)
-    should_save = SAVE_PREDICTIONS if save is None else bool(save)
-    if should_save:
+        start = time.time()
+        model_cache = app.state.model_cache
         try:
-            store_predictions(supabase, run_id, predictions, step_image_id)
+            predictions, raw_output = infer_backend(model_cache, supabase, run_id, image_array, options)
         except Exception as exc:
-            log(f"Failed to store predictions: {exc}")
-    response = {
-        "timestamp": utc_now(),
-        "run_id": run_id,
-        "processing_time_ms": duration_ms,
-        "predictions": predictions,
-    }
-    if raw_output is not None:
-        response["raw_output"] = raw_output.tolist() if isinstance(raw_output, np.ndarray) else raw_output
-    return JSONResponse(response)
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        duration_ms = int((time.time() - start) * 1000)
+        should_save = SAVE_PREDICTIONS if save is None else bool(save)
+        if should_save:
+            try:
+                store_predictions(supabase, run_id, predictions, step_image_id)
+            except Exception as exc:
+                log(f"Failed to store predictions: {exc}")
+        response = {
+            "timestamp": utc_now(),
+            "run_id": run_id,
+            "processing_time_ms": duration_ms,
+            "predictions": predictions,
+        }
+        if raw_output is not None:
+            response["raw_output"] = raw_output.tolist() if isinstance(raw_output, np.ndarray) else raw_output
+        return JSONResponse(response)
+    finally:
+        mark_request_end()
 
 
 @app.post("/models/{run_id}/reload")
@@ -582,6 +692,12 @@ def start_background_tasks():
     model_cache = ModelCache()
     app.state.model_cache = model_cache
     supabase = build_supabase_client()
+    set_worker_status("online")
+    try:
+        upsert_worker_heartbeat(supabase, status="online")
+    except Exception as exc:
+        log(f"Failed to send initial inference heartbeat: {exc}")
+    start_heartbeat_thread(supabase)
     if POLL_DEPLOYMENTS:
         thread = threading.Thread(target=deployment_loop, args=(model_cache, supabase), daemon=True)
         thread.start()
