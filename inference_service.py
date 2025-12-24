@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from supabase import create_client
 
@@ -50,6 +51,13 @@ HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "10"))
 SAVE_PREDICTIONS = os.getenv("SAVE_PREDICTIONS", "0").lower() in ("1", "true", "yes")
 ALLOW_NULL_STEP_IMAGE = os.getenv("ALLOW_NULL_STEP_IMAGE", "1").lower() in ("1", "true", "yes")
 
+CORS_ALLOW_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS", "")
+CORS_ALLOW_ORIGIN_REGEX = os.getenv("CORS_ALLOW_ORIGIN_REGEX", "")
+CORS_ALLOW_METHODS = os.getenv("CORS_ALLOW_METHODS", "GET,POST,OPTIONS")
+CORS_ALLOW_HEADERS = os.getenv("CORS_ALLOW_HEADERS", "Authorization,Content-Type,Accept")
+CORS_ALLOW_CREDENTIALS = os.getenv("CORS_ALLOW_CREDENTIALS", "0").lower() in ("1", "true", "yes")
+CORS_MAX_AGE = int(os.getenv("CORS_MAX_AGE", "600"))
+
 POLL_DEPLOYMENTS = os.getenv("POLL_DEPLOYMENTS", "1").lower() in ("1", "true", "yes")
 DEPLOYMENT_POLL_INTERVAL = int(os.getenv("DEPLOYMENT_POLL_INTERVAL", "20"))
 REGISTER_DEPLOYMENTS = os.getenv("REGISTER_DEPLOYMENTS", "1").lower() in ("1", "true", "yes")
@@ -85,6 +93,19 @@ WORKER_STATUS = "online"
 ACTIVE_REQUESTS = 0
 
 app = FastAPI(title="SaturnOS Inference Worker")
+cors_origins = [origin.strip() for origin in CORS_ALLOW_ORIGINS.split(",") if origin.strip()]
+cors_methods = [method.strip() for method in CORS_ALLOW_METHODS.split(",") if method.strip()]
+cors_headers = [header.strip() for header in CORS_ALLOW_HEADERS.split(",") if header.strip()]
+if cors_origins or CORS_ALLOW_ORIGIN_REGEX:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=cors_origins,
+        allow_origin_regex=CORS_ALLOW_ORIGIN_REGEX or None,
+        allow_credentials=CORS_ALLOW_CREDENTIALS,
+        allow_methods=cors_methods or ["GET", "POST", "OPTIONS"],
+        allow_headers=cors_headers or ["Authorization", "Content-Type", "Accept"],
+        max_age=CORS_MAX_AGE,
+    )
 
 
 def utc_now() -> str:
