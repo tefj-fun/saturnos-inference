@@ -1,14 +1,29 @@
 import io
 import os
+import shlex
 import socket
+import subprocess
+import sys
 import threading
 import time
-import urllib.request
 import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
+
+ENV_PATH = os.path.join(os.path.dirname(__file__), ".env.local")
+preload_ld_library_path = os.environ.get("LD_LIBRARY_PATH")
+load_dotenv(ENV_PATH, override=True)
+if preload_ld_library_path and os.getenv("LD_LIBRARY_PATH"):
+    current_ld_library_path = os.environ["LD_LIBRARY_PATH"]
+    if preload_ld_library_path not in current_ld_library_path:
+        os.environ["LD_LIBRARY_PATH"] = f"{current_ld_library_path}:{preload_ld_library_path}"
+if os.getenv("LD_LIBRARY_PATH") and os.getenv("_INFERENCE_REEXEC") != "1":
+    os.environ["_INFERENCE_REEXEC"] = "1"
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
 from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -27,9 +42,6 @@ RUNS_TABLE = "training_runs"
 PREDICTIONS_TABLE = "predicted_annotations"
 STEP_IMAGES_TABLE = "step_images"
 WORKERS_TABLE = "inference_workers"
-
-ENV_PATH = os.path.join(os.path.dirname(__file__), ".env.local")
-load_dotenv(ENV_PATH)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 if SUPABASE_URL and not SUPABASE_URL.endswith("/"):
@@ -87,10 +99,22 @@ WORKER_CPU_MODEL = os.getenv("WORKER_CPU_MODEL")
 WORKER_CPU = os.getenv("WORKER_CPU")
 WORKER_RAM_GB = os.getenv("WORKER_RAM_GB")
 
+AUTO_UPDATE_ENABLED = os.getenv("AUTO_UPDATE_ENABLED", "0").lower() in ("1", "true", "yes")
+AUTO_UPDATE_INTERVAL = int(os.getenv("AUTO_UPDATE_INTERVAL", "300"))
+AUTO_UPDATE_REMOTE = os.getenv("AUTO_UPDATE_REMOTE", "origin")
+AUTO_UPDATE_BRANCH = os.getenv("AUTO_UPDATE_BRANCH", "").strip()
+AUTO_UPDATE_ALLOW_DIRTY = os.getenv("AUTO_UPDATE_ALLOW_DIRTY", "0").lower() in ("1", "true", "yes")
+AUTO_UPDATE_WAIT_FOR_IDLE = os.getenv("AUTO_UPDATE_WAIT_FOR_IDLE", "1").lower() in ("1", "true", "yes")
+AUTO_UPDATE_MAX_WAIT = int(os.getenv("AUTO_UPDATE_MAX_WAIT", "60"))
+AUTO_UPDATE_RESTART_COMMAND = os.getenv("AUTO_UPDATE_RESTART_COMMAND", "").strip()
+
 WORKER_STATUS_LOCK = threading.Lock()
 ACTIVE_REQUESTS_LOCK = threading.Lock()
 WORKER_STATUS = "online"
 ACTIVE_REQUESTS = 0
+
+AUTO_UPDATE_LOCK = threading.Lock()
+AUTO_UPDATE_IN_PROGRESS = False
 
 app = FastAPI(title="SaturnOS Inference Worker")
 cors_origins = [origin.strip() for origin in CORS_ALLOW_ORIGINS.split(",") if origin.strip()]
@@ -106,6 +130,13 @@ if cors_origins or CORS_ALLOW_ORIGIN_REGEX:
         allow_headers=cors_headers or ["Authorization", "Content-Type", "Accept"],
         max_age=CORS_MAX_AGE,
     )
+
+
+@app.exception_handler(HTTPException)
+def http_exception_handler(_request: Request, exc: HTTPException):
+    detail = exc.detail
+    message = detail if isinstance(detail, str) else str(detail)
+    return JSONResponse(status_code=exc.status_code, content={"error": message})
 
 
 def utc_now() -> str:
@@ -149,6 +180,177 @@ def mark_request_end() -> None:
         ACTIVE_REQUESTS = max(0, ACTIVE_REQUESTS - 1)
         if ACTIVE_REQUESTS == 0:
             set_worker_status("online")
+
+
+def run_git_command(args: List[str], cwd: str) -> subprocess.CompletedProcess:
+    env = os.environ.copy()
+    env.setdefault("GIT_TERMINAL_PROMPT", "0")
+    return subprocess.run(
+        ["git"] + args,
+        cwd=cwd,
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+
+
+def is_git_repo(repo_root: str) -> bool:
+    result = run_git_command(["rev-parse", "--is-inside-work-tree"], repo_root)
+    return result.returncode == 0 and result.stdout.strip() == "true"
+
+
+def repo_is_dirty(repo_root: str) -> bool:
+    result = run_git_command(["status", "--porcelain"], repo_root)
+    if result.returncode != 0:
+        return True
+    return bool(result.stdout.strip())
+
+
+def resolve_update_target(repo_root: str):
+    branch = AUTO_UPDATE_BRANCH
+    if not branch:
+        result = run_git_command(["rev-parse", "--abbrev-ref", "HEAD"], repo_root)
+        if result.returncode != 0:
+            log(f"Auto-update skipped: unable to detect branch ({result.stderr.strip()}).")
+            return None, None, None, None
+        branch = result.stdout.strip()
+    if not branch or branch == "HEAD":
+        log("Auto-update skipped: detached HEAD or unknown branch.")
+        return None, None, None, None
+    upstream_result = run_git_command(
+        ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], repo_root
+    )
+    if upstream_result.returncode == 0:
+        upstream = upstream_result.stdout.strip()
+        remote = upstream.split("/", 1)[0] if "/" in upstream else AUTO_UPDATE_REMOTE
+        return branch, upstream, remote, True
+    if AUTO_UPDATE_REMOTE:
+        upstream = f"{AUTO_UPDATE_REMOTE}/{branch}"
+        return branch, upstream, AUTO_UPDATE_REMOTE, False
+    log("Auto-update skipped: no upstream branch configured.")
+    return None, None, None, None
+
+
+def git_ref(repo_root: str, ref: str) -> Optional[str]:
+    result = run_git_command(["rev-parse", ref], repo_root)
+    if result.returncode != 0:
+        log(f"Auto-update skipped: unable to resolve git ref {ref}.")
+        return None
+    return result.stdout.strip()
+
+
+def check_for_git_update(repo_root: str):
+    branch, upstream, remote, uses_tracking = resolve_update_target(repo_root)
+    if not upstream:
+        return None
+    fetch_args = ["fetch"]
+    if remote:
+        fetch_args.append(remote)
+    fetch_result = run_git_command(fetch_args, repo_root)
+    if fetch_result.returncode != 0:
+        log(f"Auto-update fetch failed: {fetch_result.stderr.strip() or fetch_result.stdout.strip()}")
+        return None
+    local = git_ref(repo_root, "HEAD")
+    remote_ref = git_ref(repo_root, upstream)
+    if not local or not remote_ref:
+        return None
+    if local == remote_ref:
+        return None
+    ff_result = run_git_command(["merge-base", "--is-ancestor", "HEAD", upstream], repo_root)
+    if ff_result.returncode != 0:
+        log("Auto-update skipped: remote has diverged from local.")
+        return None
+    return branch, uses_tracking
+
+
+def wait_for_idle(timeout_seconds: int) -> bool:
+    if not AUTO_UPDATE_WAIT_FOR_IDLE:
+        return True
+    start = time.time()
+    while True:
+        with ACTIVE_REQUESTS_LOCK:
+            active = ACTIVE_REQUESTS
+        if active == 0:
+            return True
+        if time.time() - start >= timeout_seconds:
+            return False
+        time.sleep(1)
+
+
+def restart_after_update(repo_root: str) -> None:
+    if AUTO_UPDATE_RESTART_COMMAND:
+        command = shlex.split(AUTO_UPDATE_RESTART_COMMAND)
+        if command:
+            result = subprocess.run(command, cwd=repo_root, capture_output=True, text=True)
+            if result.returncode == 0:
+                log("Auto-update restart command succeeded; exiting.")
+                os._exit(0)
+            error = result.stderr.strip() or result.stdout.strip() or "unknown error"
+            log(f"Auto-update restart command failed: {error}")
+        else:
+            log("Auto-update restart command is empty; falling back to self-restart.")
+    log("Auto-update restarting process.")
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+def perform_auto_update(repo_root: str, branch: str, uses_tracking: bool) -> None:
+    set_worker_status("updating")
+    if not AUTO_UPDATE_ALLOW_DIRTY and repo_is_dirty(repo_root):
+        log("Auto-update skipped: repo has uncommitted changes.")
+        set_worker_status("online")
+        return
+    idle_ok = wait_for_idle(AUTO_UPDATE_MAX_WAIT)
+    if not idle_ok:
+        log("Auto-update proceeding with active requests.")
+    pull_args = ["pull", "--ff-only"]
+    if not uses_tracking:
+        pull_args.extend([AUTO_UPDATE_REMOTE, branch])
+    pull_result = run_git_command(pull_args, repo_root)
+    if pull_result.returncode != 0:
+        error = pull_result.stderr.strip() or pull_result.stdout.strip() or "unknown error"
+        log(f"Auto-update pull failed: {error}")
+        set_worker_status("online")
+        return
+    log("Auto-update pulled latest changes.")
+    restart_after_update(repo_root)
+
+
+def start_auto_update_thread():
+    if not AUTO_UPDATE_ENABLED or AUTO_UPDATE_INTERVAL <= 0:
+        return None
+    repo_root = os.path.dirname(os.path.abspath(__file__))
+
+    def loop():
+        global AUTO_UPDATE_IN_PROGRESS
+        try:
+            if not is_git_repo(repo_root):
+                log("Auto-update disabled: not a git repository.")
+                return
+        except Exception as exc:
+            log(f"Auto-update disabled: git unavailable ({exc}).")
+            return
+        log(f"Auto-update enabled (interval={AUTO_UPDATE_INTERVAL}s).")
+        while True:
+            try:
+                update = check_for_git_update(repo_root)
+                if update:
+                    branch, uses_tracking = update
+                    with AUTO_UPDATE_LOCK:
+                        if AUTO_UPDATE_IN_PROGRESS:
+                            continue
+                        AUTO_UPDATE_IN_PROGRESS = True
+                    try:
+                        perform_auto_update(repo_root, branch, uses_tracking)
+                    finally:
+                        AUTO_UPDATE_IN_PROGRESS = False
+                        set_worker_status("online")
+            except Exception as exc:
+                log(f"Auto-update check failed: {exc}")
+            time.sleep(AUTO_UPDATE_INTERVAL)
+
+    thread = threading.Thread(target=loop, daemon=True)
+    thread.start()
+    return thread
 
 
 def build_worker_payload(status: Optional[str] = None) -> Dict[str, Any]:
@@ -504,13 +706,18 @@ def resolve_request_options(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def option_or_default(options: Dict[str, Any], key: str, default: Any) -> Any:
+    value = options.get(key)
+    return default if value is None else value
+
+
 def run_ultralytics(model: YOLO, image: np.ndarray, options: Dict[str, Any]) -> List[Dict[str, Any]]:
     results = model.predict(
         source=image,
-        conf=options.get("confidence", DEFAULT_CONFIDENCE),
-        iou=options.get("iou", DEFAULT_IOU),
-        imgsz=options.get("imgsz", DEFAULT_IMAGE_SIZE),
-        max_det=options.get("max_det", DEFAULT_MAX_DETECTIONS),
+        conf=option_or_default(options, "confidence", DEFAULT_CONFIDENCE),
+        iou=option_or_default(options, "iou", DEFAULT_IOU),
+        imgsz=option_or_default(options, "imgsz", DEFAULT_IMAGE_SIZE),
+        max_det=option_or_default(options, "max_det", DEFAULT_MAX_DETECTIONS),
         device=DEVICE,
         verbose=False,
     )
@@ -722,6 +929,7 @@ def start_background_tasks():
     if POLL_DEPLOYMENTS:
         thread = threading.Thread(target=deployment_loop, args=(model_cache, supabase), daemon=True)
         thread.start()
+    start_auto_update_thread()
     log(f"Inference worker started (worker_id={WORKER_ID}, backend={INFERENCE_BACKEND})")
 
 

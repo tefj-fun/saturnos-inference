@@ -47,6 +47,18 @@ Worker metadata (optional, shown in Results & Analysis status panel):
 - `WORKER_GPU_MEMORY_MB`, `WORKER_GPU_VRAM_MB`
 - `WORKER_CPU_MODEL`, `WORKER_CPU`, `WORKER_RAM_GB`
 
+Auto-update (optional):
+- `AUTO_UPDATE_ENABLED` (default `0`) to enable repo polling
+- `AUTO_UPDATE_INTERVAL` (default `300`) seconds between checks
+- `AUTO_UPDATE_REMOTE` (default `origin`) git remote to fetch/pull
+- `AUTO_UPDATE_BRANCH` (default current branch) branch to track
+- `AUTO_UPDATE_ALLOW_DIRTY` (default `0`) allow updates with local changes
+- `AUTO_UPDATE_WAIT_FOR_IDLE` (default `1`) wait for no active requests
+- `AUTO_UPDATE_MAX_WAIT` (default `60`) seconds to wait before updating anyway
+- `AUTO_UPDATE_RESTART_COMMAND` (optional) command to restart the service after pull
+  - if unset, the process re-execs itself after pulling
+- Requires a git checkout with a valid upstream or `AUTO_UPDATE_REMOTE` + branch.
+
 Supabase schema note:
 - Create `public.inference_workers` (see SaturnOS migration `0020_add_inference_workers.sql`)
   to enable the worker heartbeat status panel in the UI.
