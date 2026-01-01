@@ -84,6 +84,17 @@ python inference_service.py
 - `POST /models/{run_id}/predict` -> run inference
 - `POST /models/{run_id}/reload` -> drop cached model
 
+## Admin web interface
+This service also serves a lightweight admin dashboard:
+- `GET /admin` -> HTML dashboard (polls the API endpoints below)
+- `GET /admin/api/status` -> worker status (uptime, backend, cache, heartbeat/poll state)
+- `GET /admin/api/logs` -> recent in-memory logs (`?after=<seq>` for incremental tail, `?format=text` for plain text)
+- `GET /admin/api/requests` -> recent prediction request history
+- `POST /admin/api/models/{run_id}/reload` -> evict a cached model (admin-only)
+
+To protect the admin API, set `ADMIN_TOKEN`. The dashboard stores the token in `localStorage` and sends:
+`Authorization: Bearer <token>`.
+
 ### Predict examples
 JSON body with image URL:
 ```bash
