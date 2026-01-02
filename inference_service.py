@@ -8,7 +8,10 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+from collections import deque
 from datetime import datetime, timezone
+import platform
+import shutil
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
@@ -26,7 +29,7 @@ if os.getenv("LD_LIBRARY_PATH") and os.getenv("_INFERENCE_REEXEC") != "1":
 
 from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from supabase import create_client
 
 try:
@@ -62,6 +65,12 @@ HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "10"))
 
 SAVE_PREDICTIONS = os.getenv("SAVE_PREDICTIONS", "0").lower() in ("1", "true", "yes")
 ALLOW_NULL_STEP_IMAGE = os.getenv("ALLOW_NULL_STEP_IMAGE", "1").lower() in ("1", "true", "yes")
+
+ADMIN_ENABLED = os.getenv("ADMIN_ENABLED", "1").lower() in ("1", "true", "yes")
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
+ADMIN_LOG_BUFFER_SIZE = int(os.getenv("ADMIN_LOG_BUFFER_SIZE", "2000"))
+ADMIN_LOG_TAIL_DEFAULT = int(os.getenv("ADMIN_LOG_TAIL_DEFAULT", "200"))
+ADMIN_REQUEST_HISTORY_SIZE = int(os.getenv("ADMIN_REQUEST_HISTORY_SIZE", "200"))
 
 CORS_ALLOW_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS", "")
 if not CORS_ALLOW_ORIGINS:
@@ -118,6 +127,27 @@ ACTIVE_REQUESTS = 0
 AUTO_UPDATE_LOCK = threading.Lock()
 AUTO_UPDATE_IN_PROGRESS = False
 
+PROCESS_STARTED_AT = datetime.now(timezone.utc).isoformat()
+PROCESS_START_TIME = time.time()
+
+LOG_LOCK = threading.Lock()
+LOG_SEQ = 0
+LOG_BUFFER: "deque[Dict[str, Any]]" = deque(maxlen=max(0, ADMIN_LOG_BUFFER_SIZE))
+
+REQUEST_HISTORY_LOCK = threading.Lock()
+REQUEST_SEQ = 0
+REQUEST_HISTORY: "deque[Dict[str, Any]]" = deque(maxlen=max(0, ADMIN_REQUEST_HISTORY_SIZE))
+
+LAST_HEARTBEAT_AT: Optional[str] = None
+LAST_HEARTBEAT_ERROR: Optional[str] = None
+
+LAST_DEPLOYMENT_POLL_AT: Optional[str] = None
+LAST_DEPLOYMENT_POLL_OK_AT: Optional[str] = None
+LAST_DEPLOYMENT_POLL_ERROR: Optional[str] = None
+
+AUTO_UPDATE_LAST_CHECK_AT: Optional[str] = None
+AUTO_UPDATE_LAST_RESULT: Optional[str] = None
+
 app = FastAPI(title="SaturnOS Inference Worker")
 cors_origins = [origin.strip() for origin in CORS_ALLOW_ORIGINS.split(",") if origin.strip()]
 cors_methods = [method.strip() for method in CORS_ALLOW_METHODS.split(",") if method.strip()]
@@ -146,7 +176,13 @@ def utc_now() -> str:
 
 
 def log(message: str) -> None:
-    print(f"[{utc_now()}] {message}", flush=True)
+    global LOG_SEQ
+    timestamp = utc_now()
+    with LOG_LOCK:
+        LOG_SEQ += 1
+        if LOG_BUFFER.maxlen and LOG_BUFFER.maxlen > 0:
+            LOG_BUFFER.append({"seq": LOG_SEQ, "timestamp": timestamp, "message": message})
+    print(f"[{timestamp}] {message}", flush=True)
 
 
 def normalize_float_env(value: Optional[str]):
@@ -182,6 +218,32 @@ def mark_request_end() -> None:
         ACTIVE_REQUESTS = max(0, ACTIVE_REQUESTS - 1)
         if ACTIVE_REQUESTS == 0:
             set_worker_status("online")
+
+
+def record_request(
+    *,
+    run_id: str,
+    duration_ms: int,
+    status_code: int,
+    image_source: str,
+    saved_predictions: bool,
+) -> None:
+    global REQUEST_SEQ
+    timestamp = utc_now()
+    with REQUEST_HISTORY_LOCK:
+        REQUEST_SEQ += 1
+        if REQUEST_HISTORY.maxlen and REQUEST_HISTORY.maxlen > 0:
+            REQUEST_HISTORY.append(
+                {
+                    "seq": REQUEST_SEQ,
+                    "timestamp": timestamp,
+                    "run_id": run_id,
+                    "duration_ms": duration_ms,
+                    "status_code": status_code,
+                    "image_source": image_source,
+                    "saved_predictions": saved_predictions,
+                }
+            )
 
 
 def run_git_command(args: List[str], cwd: str) -> subprocess.CompletedProcess:
@@ -323,7 +385,7 @@ def start_auto_update_thread():
     repo_root = os.path.dirname(os.path.abspath(__file__))
 
     def loop():
-        global AUTO_UPDATE_IN_PROGRESS
+        global AUTO_UPDATE_IN_PROGRESS, AUTO_UPDATE_LAST_CHECK_AT, AUTO_UPDATE_LAST_RESULT
         try:
             if not is_git_repo(repo_root):
                 log("Auto-update disabled: not a git repository.")
@@ -334,8 +396,10 @@ def start_auto_update_thread():
         log(f"Auto-update enabled (interval={AUTO_UPDATE_INTERVAL}s).")
         while True:
             try:
+                AUTO_UPDATE_LAST_CHECK_AT = utc_now()
                 update = check_for_git_update(repo_root)
                 if update:
+                    AUTO_UPDATE_LAST_RESULT = "update_available"
                     branch, uses_tracking = update
                     with AUTO_UPDATE_LOCK:
                         if AUTO_UPDATE_IN_PROGRESS:
@@ -346,7 +410,10 @@ def start_auto_update_thread():
                     finally:
                         AUTO_UPDATE_IN_PROGRESS = False
                         set_worker_status("online")
+                else:
+                    AUTO_UPDATE_LAST_RESULT = "no_update"
             except Exception as exc:
+                AUTO_UPDATE_LAST_RESULT = f"error: {exc}"
                 log(f"Auto-update check failed: {exc}")
             time.sleep(AUTO_UPDATE_INTERVAL)
 
@@ -387,8 +454,11 @@ def build_worker_payload(status: Optional[str] = None) -> Dict[str, Any]:
 
 
 def upsert_worker_heartbeat(supabase, status: Optional[str] = None) -> None:
+    global LAST_HEARTBEAT_AT, LAST_HEARTBEAT_ERROR
     payload = build_worker_payload(status)
     supabase.table(WORKERS_TABLE).upsert(payload, on_conflict="worker_id").execute()
+    LAST_HEARTBEAT_AT = payload.get("last_seen")
+    LAST_HEARTBEAT_ERROR = None
 
 
 def start_heartbeat_thread(supabase):
@@ -399,6 +469,8 @@ def start_heartbeat_thread(supabase):
             try:
                 upsert_worker_heartbeat(supabase)
             except Exception as exc:
+                global LAST_HEARTBEAT_ERROR
+                LAST_HEARTBEAT_ERROR = str(exc)
                 log(f"Failed to update inference worker heartbeat: {exc}")
             stop_event.wait(HEARTBEAT_INTERVAL)
 
@@ -503,6 +575,7 @@ class ModelEntry:
     def __init__(self, model: YOLO, source_url: str):
         self.model = model
         self.source_url = source_url
+        self.loaded_at = time.time()
         self.last_used = time.time()
 
 
@@ -519,6 +592,22 @@ class ModelCache:
         while len(oldest) > 0 and len(self._models) > MAX_MODELS:
             run_id, _ = oldest.pop(0)
             self._models.pop(run_id, None)
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            models = []
+            for run_id, entry in self._models.items():
+                models.append(
+                    {
+                        "run_id": run_id,
+                        "source_url": entry.source_url,
+                        "loaded_at": entry.loaded_at,
+                        "last_used": entry.last_used,
+                    }
+                )
+            loading = list(self._loading.keys())
+        models.sort(key=lambda item: item.get("last_used") or 0, reverse=True)
+        return {"models": models, "loading": loading, "max_models": MAX_MODELS}
 
     def get(self, run_id: str):
         with self._lock:
@@ -778,11 +867,13 @@ def update_deployment_status(supabase, run_id: str, payload: Dict[str, Any]) -> 
 
 
 def deployment_loop(model_cache: ModelCache, supabase) -> None:
+    global LAST_DEPLOYMENT_POLL_AT, LAST_DEPLOYMENT_POLL_OK_AT, LAST_DEPLOYMENT_POLL_ERROR
     while True:
         if not POLL_DEPLOYMENTS:
             time.sleep(DEPLOYMENT_POLL_INTERVAL)
             continue
         try:
+            LAST_DEPLOYMENT_POLL_AT = utc_now()
             response = (
                 supabase.table(RUNS_TABLE)
                 .select("id, trained_model_url, deployment_status, is_deployed")
@@ -823,7 +914,10 @@ def deployment_loop(model_cache: ModelCache, supabase) -> None:
                         run_id,
                         {"deployment_url": f"{PUBLIC_BASE_URL}/models/{run_id}/predict"},
                     )
+            LAST_DEPLOYMENT_POLL_ERROR = None
+            LAST_DEPLOYMENT_POLL_OK_AT = LAST_DEPLOYMENT_POLL_AT
         except Exception as exc:
+            LAST_DEPLOYMENT_POLL_ERROR = str(exc)
             log(f"Deployment poll error: {exc}")
         time.sleep(DEPLOYMENT_POLL_INTERVAL)
 
@@ -832,6 +926,429 @@ def deployment_loop(model_cache: ModelCache, supabase) -> None:
 def health():
     return {"status": "ok", "timestamp": utc_now(), "worker_id": WORKER_ID}
 
+
+def iso_from_epoch(value: Optional[float]) -> Optional[str]:
+    if value is None:
+        return None
+    return datetime.fromtimestamp(value, tz=timezone.utc).isoformat()
+
+
+def format_duration(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def require_admin(request: Request) -> None:
+    if not ADMIN_ENABLED:
+        raise HTTPException(status_code=404, detail="Not found")
+    if not ADMIN_TOKEN:
+        return
+    header = request.headers.get("authorization", "")
+    token = ""
+    if header.lower().startswith("bearer "):
+        token = header.split(" ", 1)[1].strip()
+    if not token:
+        token = request.query_params.get("token", "").strip()
+    if not token or token != ADMIN_TOKEN:
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+ADMIN_DASHBOARD_HTML = """
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SaturnOS Inference Admin</title>
+    <style>
+      :root { --bg:#0b1020; --panel:#111a33; --muted:#9aa7c7; --text:#e7ecff; --border:#26345f; --ok:#37d67a; --warn:#f6c177; --bad:#ff5c7a; }
+      html, body { height:100%; }
+      body { margin:0; background:linear-gradient(180deg,#070b18,#0b1020 40%,#070b18); color:var(--text); font:14px/1.45 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial; }
+      .wrap { max-width:1200px; margin:0 auto; padding:18px; }
+      .top { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+      .title { font-size:18px; font-weight:700; letter-spacing:0.2px; }
+      .pill { display:inline-flex; align-items:center; gap:8px; padding:6px 10px; border:1px solid var(--border); border-radius:999px; background:rgba(17,26,51,0.7); }
+      .dot { width:9px; height:9px; border-radius:999px; background:var(--muted); box-shadow:0 0 0 3px rgba(154,167,199,0.15); }
+      .dot.ok { background:var(--ok); box-shadow:0 0 0 3px rgba(55,214,122,0.15); }
+      .dot.warn { background:var(--warn); box-shadow:0 0 0 3px rgba(246,193,119,0.15); }
+      .dot.bad { background:var(--bad); box-shadow:0 0 0 3px rgba(255,92,122,0.18); }
+      .actions { display:flex; gap:8px; flex-wrap:wrap; }
+      button { cursor:pointer; border:1px solid var(--border); border-radius:10px; background:rgba(17,26,51,0.7); color:var(--text); padding:7px 10px; }
+      button:hover { border-color:#3b4f86; }
+      .grid { display:grid; grid-template-columns: 1fr 1fr; gap:12px; margin-top:12px; }
+      @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+      .card { border:1px solid var(--border); border-radius:14px; background:rgba(17,26,51,0.65); overflow:hidden; }
+      .card h2 { margin:0; padding:10px 12px; font-size:13px; letter-spacing:0.3px; text-transform:uppercase; color:var(--muted); border-bottom:1px solid var(--border); }
+      .card .body { padding:12px; }
+      .kv { display:grid; grid-template-columns: 160px 1fr; gap:6px 10px; }
+      .k { color:var(--muted); }
+      code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, \"Liberation Mono\", \"Courier New\", monospace; font-size: 12px; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, \"Liberation Mono\", \"Courier New\", monospace; font-size: 12px; }
+      table { width:100%; border-collapse:collapse; }
+      th, td { text-align:left; padding:8px 8px; border-bottom:1px solid rgba(38,52,95,0.8); vertical-align:top; }
+      th { color:var(--muted); font-weight:600; font-size:12px; text-transform:uppercase; letter-spacing:0.25px; }
+      .logs { height: 360px; overflow:auto; background:rgba(7,11,24,0.55); border:1px solid rgba(38,52,95,0.7); border-radius:10px; padding:10px; }
+      .login { display:none; gap:8px; margin-top:10px; }
+      input { border:1px solid var(--border); border-radius:10px; padding:8px 10px; background:rgba(7,11,24,0.55); color:var(--text); width: 320px; }
+      .muted { color:var(--muted); }
+      .row { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+      .small { font-size:12px; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="top">
+        <div>
+          <div class="title">SaturnOS Inference Admin</div>
+          <div class="muted small">Dashboard polls <code>/admin/api/status</code> and <code>/admin/api/logs</code>.</div>
+        </div>
+        <div class="actions">
+          <button id="btnToken">Set token</button>
+          <button id="btnPause">Pause</button>
+          <button id="btnClearLogs">Clear view</button>
+        </div>
+      </div>
+
+      <div class="login" id="login">
+        <input id="tokenInput" placeholder="ADMIN_TOKEN (stored in localStorage)" />
+        <button id="btnSaveToken">Save</button>
+        <div class="muted small">If <code>ADMIN_TOKEN</code> is set on the server, requests must include <code>Authorization: Bearer &lt;token&gt;</code>.</div>
+      </div>
+
+      <div class="grid">
+        <div class="card">
+          <h2>Worker</h2>
+          <div class="body">
+            <div class="row">
+              <div class="pill"><span id="statusDot" class="dot"></span><span id="statusText">—</span></div>
+              <div class="pill"><span class="muted">uptime</span> <span id="uptimeText" class="mono">—</span></div>
+            </div>
+            <div style="height:10px"></div>
+            <div class="kv">
+              <div class="k">worker_id</div><div class="mono" id="workerId">—</div>
+              <div class="k">active_requests</div><div class="mono" id="activeRequests">—</div>
+              <div class="k">backend</div><div class="mono" id="backend">—</div>
+              <div class="k">device</div><div class="mono" id="device">—</div>
+              <div class="k">model_root</div><div class="mono" id="modelRoot">—</div>
+              <div class="k">max_models</div><div class="mono" id="maxModels">—</div>
+              <div class="k">heartbeat</div><div class="mono" id="heartbeat">—</div>
+              <div class="k">deploy_poll</div><div class="mono" id="deployPoll">—</div>
+              <div class="k">auto_update</div><div class="mono" id="autoUpdate">—</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>Model Cache</h2>
+          <div class="body">
+            <div class="muted small">Loaded models currently cached in-process.</div>
+            <div style="height:10px"></div>
+            <table>
+              <thead>
+                <tr>
+                  <th>run_id</th>
+                  <th>loaded_at</th>
+                  <th>last_used</th>
+                  <th>source_url</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody id="modelsBody"></tbody>
+            </table>
+            <div style="height:8px"></div>
+            <div class="muted small">Loading: <span id="loadingModels" class="mono">—</span></div>
+          </div>
+        </div>
+
+        <div class="card" style="grid-column: 1 / -1;">
+          <h2>Recent Requests</h2>
+          <div class="body">
+            <div class="muted small">Last few predictions handled by this process.</div>
+            <div style="height:10px"></div>
+            <table>
+              <thead>
+                <tr>
+                  <th>timestamp</th>
+                  <th>run_id</th>
+                  <th>status</th>
+                  <th>duration</th>
+                  <th>source</th>
+                  <th>saved</th>
+                </tr>
+              </thead>
+              <tbody id="requestsBody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card" style="grid-column: 1 / -1;">
+          <h2>Logs</h2>
+          <div class="body">
+            <div class="logs mono" id="logs"></div>
+            <div style="height:8px"></div>
+            <div class="muted small">Tip: use <code>ADMIN_LOG_BUFFER_SIZE</code> to adjust in-memory log retention.</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+      let paused = false;
+      let afterLogSeq = 0;
+      const storageKey = "saturnos_inference_admin_token";
+
+      function getToken() { return localStorage.getItem(storageKey) || ""; }
+      function setToken(value) { localStorage.setItem(storageKey, value || ""); }
+
+      function authHeaders() {
+        const token = getToken();
+        return token ? { "Authorization": `Bearer ${token}` } : {};
+      }
+
+      function showLogin(show) {
+        $("login").style.display = show ? "flex" : "none";
+        $("tokenInput").value = getToken();
+      }
+
+      async function fetchJson(url, opts = {}) {
+        const res = await fetch(url, { ...opts, headers: { ...(opts.headers || {}), ...authHeaders() } });
+        if (res.status === 401) {
+          showLogin(true);
+          throw new Error("unauthorized");
+        }
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return await res.json();
+      }
+
+      function setStatusPill(status) {
+        const dot = $("statusDot");
+        dot.className = "dot";
+        if (status === "online") dot.classList.add("ok");
+        else if (status === "busy" || status === "updating") dot.classList.add("warn");
+        else dot.classList.add("bad");
+        $("statusText").textContent = status || "—";
+      }
+
+      function renderModels(models) {
+        const body = $("modelsBody");
+        body.innerHTML = "";
+        for (const model of (models || [])) {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `
+            <td class="mono">${model.run_id || ""}</td>
+            <td class="mono">${model.loaded_at || ""}</td>
+            <td class="mono">${model.last_used || ""}</td>
+            <td class="mono">${(model.source_url || "").slice(0, 80)}${(model.source_url || "").length > 80 ? "…" : ""}</td>
+            <td><button data-run="${model.run_id}">Reload</button></td>
+          `;
+          tr.querySelector("button").addEventListener("click", async (e) => {
+            const runId = e.target.getAttribute("data-run");
+            try {
+              await fetchJson(`/admin/api/models/${encodeURIComponent(runId)}/reload`, { method: "POST" });
+            } catch (_) {}
+          });
+          body.appendChild(tr);
+        }
+      }
+
+      function renderRequests(entries) {
+        const body = $("requestsBody");
+        body.innerHTML = "";
+        for (const req of (entries || [])) {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `
+            <td class="mono">${req.timestamp || ""}</td>
+            <td class="mono">${req.run_id || ""}</td>
+            <td class="mono">${req.status_code ?? ""}</td>
+            <td class="mono">${req.duration_ms ?? ""}ms</td>
+            <td class="mono">${req.image_source || ""}</td>
+            <td class="mono">${req.saved_predictions ? "yes" : "no"}</td>
+          `;
+          body.appendChild(tr);
+        }
+      }
+
+      function appendLogs(entries) {
+        const box = $("logs");
+        const nearBottom = (box.scrollTop + box.clientHeight) >= (box.scrollHeight - 30);
+        for (const e of (entries || [])) {
+          const line = document.createElement("div");
+          line.textContent = `[${e.timestamp}] ${e.message}`;
+          box.appendChild(line);
+        }
+        if (nearBottom) box.scrollTop = box.scrollHeight;
+      }
+
+      async function poll() {
+        if (paused) return;
+        try {
+          const status = await fetchJson("/admin/api/status");
+          showLogin(false);
+          setStatusPill(status.worker_status);
+          $("uptimeText").textContent = status.uptime_human || "—";
+          $("workerId").textContent = status.worker_id || "—";
+          $("activeRequests").textContent = String(status.active_requests ?? "—");
+          $("backend").textContent = status.inference_backend || "—";
+          $("device").textContent = status.device || "—";
+          $("modelRoot").textContent = status.model_root || "—";
+          $("maxModels").textContent = String(status.max_models ?? "—");
+          $("heartbeat").textContent = status.heartbeat?.last_ok_at ? `ok @ ${status.heartbeat.last_ok_at}` : (status.heartbeat?.last_error ? `error: ${status.heartbeat.last_error}` : "—");
+          $("deployPoll").textContent = status.deployment_poll?.last_ok_at ? `ok @ ${status.deployment_poll.last_ok_at}` : (status.deployment_poll?.last_error ? `error: ${status.deployment_poll.last_error}` : "—");
+          $("autoUpdate").textContent = status.auto_update?.enabled ? `enabled (${status.auto_update.last_result || "—"})` : "disabled";
+          renderModels(status.model_cache?.models || []);
+          $("loadingModels").textContent = (status.model_cache?.loading || []).join(", ") || "—";
+
+          const requests = await fetchJson("/admin/api/requests?limit=20");
+          renderRequests(requests.entries || []);
+
+          const logs = await fetchJson(`/admin/api/logs?after=${afterLogSeq}`);
+          afterLogSeq = logs.next_after || afterLogSeq;
+          appendLogs(logs.entries || []);
+        } catch (err) {
+          if (String(err.message || "").includes("unauthorized")) return;
+        }
+      }
+
+      $("btnToken").addEventListener("click", () => showLogin(true));
+      $("btnSaveToken").addEventListener("click", () => { setToken($("tokenInput").value.trim()); showLogin(false); afterLogSeq = 0; });
+      $("btnPause").addEventListener("click", () => { paused = !paused; $("btnPause").textContent = paused ? "Resume" : "Pause"; });
+      $("btnClearLogs").addEventListener("click", () => { $("logs").innerHTML = ""; afterLogSeq = 0; });
+
+      showLogin(false);
+      poll();
+      setInterval(poll, 2000);
+    </script>
+  </body>
+</html>
+""".strip()
+
+
+@app.get("/admin")
+def admin_dashboard():
+    if not ADMIN_ENABLED:
+        raise HTTPException(status_code=404, detail="Not found")
+    return HTMLResponse(ADMIN_DASHBOARD_HTML)
+
+
+@app.get("/admin/api/status")
+def admin_status(request: Request):
+    require_admin(request)
+    with ACTIVE_REQUESTS_LOCK:
+        active_requests = ACTIVE_REQUESTS
+    model_cache: Optional[ModelCache] = getattr(app.state, "model_cache", None)
+    model_snapshot = model_cache.snapshot() if model_cache else {"models": [], "loading": [], "max_models": MAX_MODELS}
+    for item in model_snapshot.get("models", []):
+        item["loaded_at"] = iso_from_epoch(item.get("loaded_at"))
+        item["last_used"] = iso_from_epoch(item.get("last_used"))
+
+    try:
+        disk = shutil.disk_usage(MODEL_ROOT)
+        disk_usage = {
+            "total_bytes": int(disk.total),
+            "used_bytes": int(disk.used),
+            "free_bytes": int(disk.free),
+        }
+    except Exception:
+        disk_usage = None
+
+    with LOG_LOCK:
+        current_log_seq = LOG_SEQ
+
+    uptime_seconds = int(max(0, time.time() - PROCESS_START_TIME))
+    return {
+        "timestamp": utc_now(),
+        "worker_id": WORKER_ID,
+        "worker_status": get_worker_status(),
+        "active_requests": active_requests,
+        "process": {
+            "pid": os.getpid(),
+            "started_at": PROCESS_STARTED_AT,
+            "python": platform.python_version(),
+            "platform": platform.platform(),
+            "log_seq": current_log_seq,
+        },
+        "uptime_seconds": uptime_seconds,
+        "uptime_human": format_duration(uptime_seconds),
+        "inference_backend": INFERENCE_BACKEND,
+        "device": DEVICE,
+        "model_root": MODEL_ROOT,
+        "max_models": MAX_MODELS,
+        "disk_usage": disk_usage,
+        "supabase": {
+            "configured": bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY),
+            "url": SUPABASE_URL,
+            "artifacts_bucket": SUPABASE_ARTIFACTS_BUCKET,
+        },
+        "heartbeat": {"interval_seconds": HEARTBEAT_INTERVAL, "last_ok_at": LAST_HEARTBEAT_AT, "last_error": LAST_HEARTBEAT_ERROR},
+        "deployment_poll": {
+            "enabled": bool(POLL_DEPLOYMENTS),
+            "interval_seconds": DEPLOYMENT_POLL_INTERVAL,
+            "last_attempt_at": LAST_DEPLOYMENT_POLL_AT,
+            "last_ok_at": LAST_DEPLOYMENT_POLL_OK_AT,
+            "last_error": LAST_DEPLOYMENT_POLL_ERROR,
+        },
+        "auto_update": {
+            "enabled": bool(AUTO_UPDATE_ENABLED),
+            "interval_seconds": AUTO_UPDATE_INTERVAL,
+            "in_progress": bool(AUTO_UPDATE_IN_PROGRESS),
+            "last_check_at": AUTO_UPDATE_LAST_CHECK_AT,
+            "last_result": AUTO_UPDATE_LAST_RESULT,
+        },
+        "model_cache": model_snapshot,
+        "admin": {"enabled": bool(ADMIN_ENABLED), "auth_required": bool(ADMIN_TOKEN)},
+    }
+
+
+@app.get("/admin/api/logs")
+def admin_logs(
+    request: Request,
+    limit: int = Query(default=ADMIN_LOG_TAIL_DEFAULT, ge=1, le=5000),
+    after: int = Query(default=0, ge=0),
+    format: str = Query(default="json"),
+):
+    require_admin(request)
+    with LOG_LOCK:
+        entries = [entry for entry in LOG_BUFFER if int(entry.get("seq", 0)) > after]
+        if limit:
+            entries = entries[-limit:]
+        next_after = entries[-1]["seq"] if entries else after
+    if format.lower() == "text":
+        body = "\n".join([f"[{e['timestamp']}] {e['message']}" for e in entries])
+        return PlainTextResponse(body)
+    return {"entries": entries, "next_after": next_after}
+
+
+@app.get("/admin/api/requests")
+def admin_requests(
+    request: Request,
+    limit: int = Query(default=50, ge=1, le=5000),
+):
+    require_admin(request)
+    with REQUEST_HISTORY_LOCK:
+        entries = list(REQUEST_HISTORY)[-limit:]
+    return {"entries": entries}
+
+
+@app.post("/admin/api/models/{run_id}/reload")
+def admin_reload_model(run_id: str, request: Request):
+    require_admin(request)
+    model_cache: Optional[ModelCache] = getattr(app.state, "model_cache", None)
+    if not model_cache:
+        raise HTTPException(status_code=503, detail="Model cache not initialized.")
+    with model_cache._lock:
+        model_cache._models.pop(run_id, None)
+        model_cache._loading.pop(run_id, None)
+    return {"status": "ok", "run_id": run_id}
 
 @app.get("/models")
 def list_models():
@@ -858,9 +1375,11 @@ async def predict(
     image_bytes = None
     image_url = None
     step_image_id = None
+    image_source = "unknown"
     if image or file:
         upload = image or file
         image_bytes = await upload.read()
+        image_source = "upload"
     else:
         content_type = request.headers.get("content-type", "")
         if "application/json" in content_type:
@@ -872,6 +1391,7 @@ async def predict(
             payload = await request.form()
             image_url = payload.get("image_url") or payload.get("url")
             step_image_id = payload.get("step_image_id") or payload.get("image_id")
+        image_source = "url" if image_url else "unknown"
     if image_bytes:
         if len(image_bytes) > MAX_IMAGE_BYTES:
             raise HTTPException(status_code=413, detail="Image exceeds MAX_IMAGE_BYTES limit.")
@@ -883,14 +1403,18 @@ async def predict(
     if not step_image_id and image_url:
         step_image_id = lookup_step_image_id(supabase, image_url)
     mark_request_start()
+    infer_start = time.time()
+    status_code = 500
+    duration_ms = 0
+    should_save = False
     try:
-        start = time.time()
         model_cache = app.state.model_cache
         try:
             predictions, raw_output = infer_backend(model_cache, supabase, run_id, image_array, options)
         except Exception as exc:
+            status_code = 500
             raise HTTPException(status_code=500, detail=str(exc)) from exc
-        duration_ms = int((time.time() - start) * 1000)
+        duration_ms = int((time.time() - infer_start) * 1000)
         should_save = SAVE_PREDICTIONS if save is None else bool(save)
         if should_save:
             try:
@@ -905,8 +1429,24 @@ async def predict(
         }
         if raw_output is not None:
             response["raw_output"] = raw_output.tolist() if isinstance(raw_output, np.ndarray) else raw_output
+        status_code = 200
         return JSONResponse(response)
+    except HTTPException as exc:
+        status_code = exc.status_code
+        raise
     finally:
+        if duration_ms == 0:
+            duration_ms = int((time.time() - infer_start) * 1000)
+        try:
+            record_request(
+                run_id=run_id,
+                duration_ms=duration_ms,
+                status_code=status_code,
+                image_source=image_source,
+                saved_predictions=bool(should_save and status_code == 200),
+            )
+        except Exception:
+            pass
         mark_request_end()
 
 
