@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 import platform
 import shutil
 from typing import Any, Dict, List, Optional
+import re
 
 from dotenv import load_dotenv
 
@@ -29,7 +30,7 @@ if os.getenv("LD_LIBRARY_PATH") and os.getenv("_INFERENCE_REEXEC") != "1":
 
 from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from supabase import create_client
 
 try:
@@ -927,6 +928,18 @@ def health():
     return {"status": "ok", "timestamp": utc_now(), "worker_id": WORKER_ID}
 
 
+@app.get("/")
+def root():
+    if ADMIN_ENABLED:
+        return RedirectResponse(url="/admin", status_code=307)
+    return {"service": "saturnos-inference", "status": "ok", "timestamp": utc_now()}
+
+
+@app.get("/favicon.ico")
+def favicon():
+    return Response(status_code=204)
+
+
 def iso_from_epoch(value: Optional[float]) -> Optional[str]:
     if value is None:
         return None
@@ -941,6 +954,248 @@ def format_duration(seconds: int) -> str:
     if days:
         return f"{days}d {hours:02d}:{minutes:02d}:{secs:02d}"
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def _read_file_text(path: str) -> Optional[str]:
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read()
+    except Exception:
+        return None
+
+
+def _run_command(args: List[str], timeout_seconds: float = 2.0) -> Optional[str]:
+    try:
+        proc = subprocess.run(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+        out = (proc.stdout or "").strip()
+        return out or None
+    except Exception:
+        return None
+
+
+def get_gpu_memory_snapshot() -> Optional[Dict[str, Any]]:
+    devices: List[Dict[str, Any]] = []
+
+    # Method 1: NVML (best overall, if available)
+    try:
+        import pynvml  # type: ignore
+
+        pynvml.nvmlInit()
+        try:
+            count = int(pynvml.nvmlDeviceGetCount())
+            for idx in range(count):
+                handle = pynvml.nvmlDeviceGetHandleByIndex(idx)
+                name = pynvml.nvmlDeviceGetName(handle)
+                try:
+                    if isinstance(name, (bytes, bytearray)):
+                        name = name.decode("utf-8", errors="ignore")
+                except Exception:
+                    pass
+                mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                devices.append(
+                    {
+                        "index": idx,
+                        "name": str(name) if name is not None else None,
+                        "total_bytes": int(getattr(mem, "total", 0)) or None,
+                        "used_bytes": int(getattr(mem, "used", 0)) or None,
+                        "free_bytes": int(getattr(mem, "free", 0)) or None,
+                    }
+                )
+        finally:
+            try:
+                pynvml.nvmlShutdown()
+            except Exception:
+                pass
+        return {"method": "nvml", "devices": devices}
+    except Exception:
+        pass
+
+    # Method 2: nvidia-smi (common on desktop/server NVIDIA setups)
+    if shutil.which("nvidia-smi"):
+        out = _run_command(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,name,memory.total,memory.used,memory.free",
+                "--format=csv,noheader,nounits",
+            ],
+            timeout_seconds=2.0,
+        )
+        if out:
+            for line in out.splitlines():
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) < 5:
+                    continue
+                try:
+                    idx = int(parts[0])
+                except Exception:
+                    idx = None
+                name = parts[1] if len(parts) > 1 else None
+                try:
+                    total = int(float(parts[2])) * 1024 * 1024
+                    used = int(float(parts[3])) * 1024 * 1024
+                    free = int(float(parts[4])) * 1024 * 1024
+                except Exception:
+                    total = used = free = None
+                devices.append(
+                    {
+                        "index": idx,
+                        "name": name,
+                        "total_bytes": total,
+                        "used_bytes": used,
+                        "free_bytes": free,
+                    }
+                )
+            if devices:
+                return {"method": "nvidia-smi", "devices": devices}
+
+    # Method 3: torch (process-level allocation; does not show other processes)
+    try:
+        import torch  # type: ignore
+
+        if torch.cuda.is_available():
+            count = int(torch.cuda.device_count())
+            for idx in range(count):
+                props = torch.cuda.get_device_properties(idx)
+                total = int(getattr(props, "total_memory", 0)) or None
+                allocated = int(torch.cuda.memory_allocated(idx))
+                reserved = int(torch.cuda.memory_reserved(idx))
+                devices.append(
+                    {
+                        "index": idx,
+                        "name": getattr(props, "name", None),
+                        "total_bytes": total,
+                        "process_allocated_bytes": allocated,
+                        "process_reserved_bytes": reserved,
+                    }
+                )
+            if devices:
+                return {"method": "torch", "devices": devices}
+    except Exception:
+        pass
+
+    return None
+
+
+def get_memory_snapshot() -> Optional[Dict[str, Any]]:
+    total_bytes: Optional[int] = None
+    available_bytes: Optional[int] = None
+    process_rss_bytes: Optional[int] = None
+    cgroup_limit_bytes: Optional[int] = None
+    cgroup_current_bytes: Optional[int] = None
+
+    try:
+        import psutil  # type: ignore
+
+        vm = psutil.virtual_memory()
+        total_bytes = int(vm.total)
+        available_bytes = int(getattr(vm, "available", None) or 0) or None
+        process_rss_bytes = int(psutil.Process(os.getpid()).memory_info().rss)
+    except Exception:
+        pass
+
+    if (total_bytes is None or available_bytes is None) and sys.platform.startswith("linux"):
+        meminfo = _read_file_text("/proc/meminfo")
+        if meminfo:
+            m_total = re.search(r"^MemTotal:\\s+(\\d+)\\s+kB\\s*$", meminfo, flags=re.MULTILINE)
+            m_avail = re.search(r"^MemAvailable:\\s+(\\d+)\\s+kB\\s*$", meminfo, flags=re.MULTILINE)
+            if m_total:
+                total_bytes = int(m_total.group(1)) * 1024
+            if m_avail:
+                available_bytes = int(m_avail.group(1)) * 1024
+
+    if process_rss_bytes is None and sys.platform.startswith("linux"):
+        status = _read_file_text("/proc/self/status")
+        if status:
+            m_rss = re.search(r"^VmRSS:\\s+(\\d+)\\s+kB\\s*$", status, flags=re.MULTILINE)
+            if m_rss:
+                process_rss_bytes = int(m_rss.group(1)) * 1024
+
+    if sys.platform.startswith("linux"):
+        # Respect container memory limits when present (cgroup v2 or v1).
+        raw_max = _read_file_text("/sys/fs/cgroup/memory.max")
+        raw_current = _read_file_text("/sys/fs/cgroup/memory.current")
+        limit = None
+        current = None
+        if raw_max:
+            raw_max = raw_max.strip()
+            if raw_max.isdigit():
+                limit = int(raw_max)
+        if raw_current:
+            raw_current = raw_current.strip()
+            if raw_current.isdigit():
+                current = int(raw_current)
+
+        if limit is None:
+            raw_limit = _read_file_text("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+            raw_usage = _read_file_text("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+            if raw_limit and raw_limit.strip().isdigit():
+                limit = int(raw_limit.strip())
+            if raw_usage and raw_usage.strip().isdigit():
+                current = int(raw_usage.strip())
+
+        # Ignore "no limit" sentinels (very large values).
+        if limit is not None and limit > 0 and limit < (1 << 60):
+            cgroup_limit_bytes = limit
+            if total_bytes is None or limit < total_bytes:
+                total_bytes = limit
+            if current is not None and current >= 0:
+                cgroup_current_bytes = current
+                available_bytes = max(0, int(total_bytes or limit) - current)
+
+    if (total_bytes is None or available_bytes is None) and os.name == "nt":
+        try:
+            import ctypes
+
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            stat = MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                total_bytes = int(stat.ullTotalPhys)
+                available_bytes = int(stat.ullAvailPhys)
+        except Exception:
+            pass
+
+    if total_bytes is None and available_bytes is None and process_rss_bytes is None:
+        return None
+
+    used_bytes: Optional[int] = None
+    used_percent: Optional[float] = None
+    process_rss_percent: Optional[float] = None
+    if total_bytes and available_bytes is not None:
+        used_bytes = int(max(0, total_bytes - available_bytes))
+        used_percent = (used_bytes / total_bytes) * 100.0 if total_bytes > 0 else None
+    if total_bytes and process_rss_bytes is not None and total_bytes > 0:
+        process_rss_percent = (process_rss_bytes / total_bytes) * 100.0
+
+    return {
+        "system_total_bytes": total_bytes,
+        "system_available_bytes": available_bytes,
+        "system_used_bytes": used_bytes,
+        "system_used_percent": used_percent,
+        "process_rss_bytes": process_rss_bytes,
+        "process_rss_percent": process_rss_percent,
+        "cgroup_limit_bytes": cgroup_limit_bytes,
+        "cgroup_current_bytes": cgroup_current_bytes,
+    }
 
 
 def require_admin(request: Request) -> None:
@@ -1040,10 +1295,17 @@ ADMIN_DASHBOARD_HTML = """
               <div class="k">device</div><div class="mono" id="device">—</div>
               <div class="k">model_root</div><div class="mono" id="modelRoot">—</div>
               <div class="k">max_models</div><div class="mono" id="maxModels">—</div>
+              <div class="k">models_loaded</div><div class="mono" id="modelsLoaded">—</div>
+              <div class="k">models_loading</div><div class="mono" id="modelsLoading">—</div>
+              <div class="k">ram_system</div><div class="mono" id="ramSystem">—</div>
+              <div class="k">ram_process</div><div class="mono" id="ramProcess">—</div>
+              <div class="k">gpu_vram</div><div class="mono" id="gpuVram">—</div>
               <div class="k">heartbeat</div><div class="mono" id="heartbeat">—</div>
               <div class="k">deploy_poll</div><div class="mono" id="deployPoll">—</div>
               <div class="k">auto_update</div><div class="mono" id="autoUpdate">—</div>
             </div>
+            <div style="height:6px"></div>
+            <div class="muted small">Process RSS is a good proxy for in-memory model + runtime usage.</div>
           </div>
         </div>
 
@@ -1189,6 +1451,18 @@ ADMIN_DASHBOARD_HTML = """
         if (nearBottom) box.scrollTop = box.scrollHeight;
       }
 
+      function fmtBytes(bytes) {
+        if (bytes === null || bytes === undefined) return "—";
+        const b = Number(bytes);
+        if (!isFinite(b)) return "—";
+        const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+        let v = Math.max(0, b);
+        let u = 0;
+        while (v >= 1024 && u < units.length - 1) { v /= 1024; u += 1; }
+        const digits = u >= 3 ? 2 : 0;
+        return `${v.toFixed(digits)} ${units[u]}`;
+      }
+
       async function poll() {
         if (paused) return;
         try {
@@ -1202,6 +1476,41 @@ ADMIN_DASHBOARD_HTML = """
           $("device").textContent = status.device || "—";
           $("modelRoot").textContent = status.model_root || "—";
           $("maxModels").textContent = String(status.max_models ?? "—");
+          $("modelsLoaded").textContent = `${status.model_cache?.loaded_count ?? (status.model_cache?.models?.length ?? "—")} / ${status.model_cache?.max_models ?? status.max_models ?? "—"}`;
+          $("modelsLoading").textContent = String(status.model_cache?.loading_count ?? (status.model_cache?.loading?.length ?? 0));
+
+          const mem = status.memory || null;
+          if (mem && mem.system_total_bytes) {
+            const usedPct = (mem.system_used_percent !== null && mem.system_used_percent !== undefined) ? `${mem.system_used_percent.toFixed(1)}%` : "—";
+            $("ramSystem").textContent = `${fmtBytes(mem.system_used_bytes)} / ${fmtBytes(mem.system_total_bytes)} (${usedPct}), avail ${fmtBytes(mem.system_available_bytes)}`;
+            const rssPct = (mem.process_rss_percent !== null && mem.process_rss_percent !== undefined) ? `${mem.process_rss_percent.toFixed(1)}%` : "—";
+            $("ramProcess").textContent = `${fmtBytes(mem.process_rss_bytes)} (${rssPct} of total)`;
+          } else {
+            $("ramSystem").textContent = "—";
+            $("ramProcess").textContent = "—";
+          }
+
+          const gpu = status.gpu_memory || null;
+          if (gpu && Array.isArray(gpu.devices) && gpu.devices.length) {
+            const lines = [];
+            for (const d of gpu.devices) {
+              const idx = (d.index !== null && d.index !== undefined) ? String(d.index) : "?";
+              if (d.total_bytes && (d.used_bytes !== null && d.used_bytes !== undefined)) {
+                const pct = (Number(d.used_bytes) / Number(d.total_bytes)) * 100.0;
+                lines.push(`#${idx} ${fmtBytes(d.used_bytes)} / ${fmtBytes(d.total_bytes)} (${pct.toFixed(1)}%)`);
+              } else if (d.total_bytes && (d.process_reserved_bytes !== null && d.process_reserved_bytes !== undefined)) {
+                const pct = (Number(d.process_reserved_bytes) / Number(d.total_bytes)) * 100.0;
+                lines.push(`#${idx} reserved ${fmtBytes(d.process_reserved_bytes)} / ${fmtBytes(d.total_bytes)} (${pct.toFixed(1)}%)`);
+              } else if (d.total_bytes && (d.process_allocated_bytes !== null && d.process_allocated_bytes !== undefined)) {
+                const pct = (Number(d.process_allocated_bytes) / Number(d.total_bytes)) * 100.0;
+                lines.push(`#${idx} alloc ${fmtBytes(d.process_allocated_bytes)} / ${fmtBytes(d.total_bytes)} (${pct.toFixed(1)}%)`);
+              }
+            }
+            $("gpuVram").textContent = lines.join(" | ") || "—";
+          } else {
+            $("gpuVram").textContent = "—";
+          }
+
           $("heartbeat").textContent = status.heartbeat?.last_ok_at ? `ok @ ${status.heartbeat.last_ok_at}` : (status.heartbeat?.last_error ? `error: ${status.heartbeat.last_error}` : "—");
           $("deployPoll").textContent = status.deployment_poll?.last_ok_at ? `ok @ ${status.deployment_poll.last_ok_at}` : (status.deployment_poll?.last_error ? `error: ${status.deployment_poll.last_error}` : "—");
           $("autoUpdate").textContent = status.auto_update?.enabled ? `enabled (${status.auto_update.last_result || "—"})` : "disabled";
@@ -1247,6 +1556,8 @@ def admin_status(request: Request):
         active_requests = ACTIVE_REQUESTS
     model_cache: Optional[ModelCache] = getattr(app.state, "model_cache", None)
     model_snapshot = model_cache.snapshot() if model_cache else {"models": [], "loading": [], "max_models": MAX_MODELS}
+    model_snapshot["loaded_count"] = len(model_snapshot.get("models") or [])
+    model_snapshot["loading_count"] = len(model_snapshot.get("loading") or [])
     for item in model_snapshot.get("models", []):
         item["loaded_at"] = iso_from_epoch(item.get("loaded_at"))
         item["last_used"] = iso_from_epoch(item.get("last_used"))
@@ -1265,6 +1576,8 @@ def admin_status(request: Request):
         current_log_seq = LOG_SEQ
 
     uptime_seconds = int(max(0, time.time() - PROCESS_START_TIME))
+    memory = get_memory_snapshot()
+    gpu_memory = get_gpu_memory_snapshot()
     return {
         "timestamp": utc_now(),
         "worker_id": WORKER_ID,
@@ -1284,6 +1597,8 @@ def admin_status(request: Request):
         "model_root": MODEL_ROOT,
         "max_models": MAX_MODELS,
         "disk_usage": disk_usage,
+        "memory": memory,
+        "gpu_memory": gpu_memory,
         "supabase": {
             "configured": bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY),
             "url": SUPABASE_URL,
