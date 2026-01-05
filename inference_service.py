@@ -60,6 +60,8 @@ DEFAULT_IOU = float(os.getenv("DEFAULT_IOU", "0.45"))
 DEFAULT_IMAGE_SIZE = int(os.getenv("DEFAULT_IMAGE_SIZE", "640"))
 DEFAULT_MAX_DETECTIONS = int(os.getenv("DEFAULT_MAX_DETECTIONS", "300"))
 DEVICE = os.getenv("DEVICE", "0")
+MODEL_FUSE = os.getenv("MODEL_FUSE", "1").lower() in ("1", "true", "yes")
+MODEL_HALF = os.getenv("MODEL_HALF", "0").lower() in ("1", "true", "yes")
 MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_BYTES", str(10 * 1024 * 1024)))
 IMAGE_FETCH_TIMEOUT = int(os.getenv("IMAGE_FETCH_TIMEOUT", "15"))
 HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "10"))
@@ -138,6 +140,8 @@ LOG_BUFFER: "deque[Dict[str, Any]]" = deque(maxlen=max(0, ADMIN_LOG_BUFFER_SIZE)
 REQUEST_HISTORY_LOCK = threading.Lock()
 REQUEST_SEQ = 0
 REQUEST_HISTORY: "deque[Dict[str, Any]]" = deque(maxlen=max(0, ADMIN_REQUEST_HISTORY_SIZE))
+
+SUPABASE_CLIENT_LOCK = threading.Lock()
 
 LAST_HEARTBEAT_AT: Optional[str] = None
 LAST_HEARTBEAT_ERROR: Optional[str] = None
@@ -664,6 +668,11 @@ class ModelCache:
         local_path = resolve_model_path(trained_model_url, run_record, supabase)
         log(f"Loading model for run {run_record['id']} from {local_path}")
         model = YOLO(local_path)
+        if MODEL_FUSE:
+            try:
+                model.fuse()
+            except Exception as exc:
+                log(f"Model fuse skipped for run {run_record['id']}: {exc}")
         return model, trained_model_url
 
 
@@ -761,6 +770,19 @@ def extract_class_names(model: YOLO) -> Dict[int, str]:
     return {}
 
 
+def should_use_half() -> bool:
+    if not MODEL_HALF:
+        return False
+    if str(DEVICE).lower() in ("cpu", "-1"):
+        return False
+    try:
+        import torch  # type: ignore
+
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
 def store_predictions(
     supabase,
     run_id: str,
@@ -811,6 +833,7 @@ def run_ultralytics(model: YOLO, image: np.ndarray, options: Dict[str, Any]) -> 
         imgsz=option_or_default(options, "imgsz", DEFAULT_IMAGE_SIZE),
         max_det=option_or_default(options, "max_det", DEFAULT_MAX_DETECTIONS),
         device=DEVICE,
+        half=should_use_half(),
         verbose=False,
     )
     predictions: List[Dict[str, Any]] = []
@@ -849,6 +872,19 @@ def build_supabase_client():
     return create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 
+def get_supabase_client():
+    client = getattr(app.state, "supabase", None)
+    if client:
+        return client
+    with SUPABASE_CLIENT_LOCK:
+        client = getattr(app.state, "supabase", None)
+        if client:
+            return client
+        client = build_supabase_client()
+        app.state.supabase = client
+        return client
+
+
 def infer_backend(model_cache: ModelCache, supabase, run_id: str, image: np.ndarray, options: Dict[str, Any]):
     if INFERENCE_BACKEND == "triton":
         if not TRITON_URL:
@@ -857,6 +893,10 @@ def infer_backend(model_cache: ModelCache, supabase, run_id: str, image: np.ndar
         class_names = {}
         predictions, raw_output = run_triton(triton, run_id, image, class_names)
         return predictions, raw_output
+    model = model_cache.get(run_id)
+    if model:
+        predictions = run_ultralytics(model, image, options)
+        return predictions, None
     run_record = get_run(supabase, run_id)
     model = model_cache.get_or_load(run_id, run_record, supabase)
     predictions = run_ultralytics(model, image, options)
@@ -1667,7 +1707,7 @@ def admin_reload_model(run_id: str, request: Request):
 
 @app.get("/models")
 def list_models():
-    supabase = build_supabase_client()
+    supabase = get_supabase_client()
     response = (
         supabase.table(RUNS_TABLE)
         .select("id, run_name, base_model, deployment_status, is_deployed, trained_model_url")
@@ -1685,12 +1725,13 @@ async def predict(
     file: Optional[UploadFile] = File(None),
     save: Optional[bool] = Query(default=None),
 ):
-    supabase = build_supabase_client()
+    supabase = get_supabase_client()
     options: Dict[str, Any] = {}
     image_bytes = None
     image_url = None
     step_image_id = None
     image_source = "unknown"
+    should_save = SAVE_PREDICTIONS if save is None else bool(save)
     if image or file:
         upload = image or file
         image_bytes = await upload.read()
@@ -1715,13 +1756,12 @@ async def predict(
         image_array = load_image_from_url(image_url)
     else:
         raise HTTPException(status_code=400, detail="No image provided.")
-    if not step_image_id and image_url:
+    if not step_image_id and image_url and should_save:
         step_image_id = lookup_step_image_id(supabase, image_url)
     mark_request_start()
     infer_start = time.time()
     status_code = 500
     duration_ms = 0
-    should_save = False
     try:
         model_cache = app.state.model_cache
         try:
@@ -1730,7 +1770,6 @@ async def predict(
             status_code = 500
             raise HTTPException(status_code=500, detail=str(exc)) from exc
         duration_ms = int((time.time() - infer_start) * 1000)
-        should_save = SAVE_PREDICTIONS if save is None else bool(save)
         if should_save:
             try:
                 store_predictions(supabase, run_id, predictions, step_image_id)
@@ -1776,7 +1815,7 @@ def reload_model(run_id: str):
 def start_background_tasks():
     model_cache = ModelCache()
     app.state.model_cache = model_cache
-    supabase = build_supabase_client()
+    supabase = get_supabase_client()
     set_worker_status("online")
     try:
         upsert_worker_heartbeat(supabase, status="online")
@@ -1787,7 +1826,11 @@ def start_background_tasks():
         thread = threading.Thread(target=deployment_loop, args=(model_cache, supabase), daemon=True)
         thread.start()
     start_auto_update_thread()
-    log(f"Inference worker started (worker_id={WORKER_ID}, backend={INFERENCE_BACKEND})")
+    log(
+        "Inference worker started "
+        f"(worker_id={WORKER_ID}, backend={INFERENCE_BACKEND}, "
+        f"model_fuse={MODEL_FUSE}, model_half={MODEL_HALF})"
+    )
 
 
 @app.on_event("startup")

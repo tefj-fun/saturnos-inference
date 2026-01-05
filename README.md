@@ -26,6 +26,8 @@ Common options:
 - `DEFAULT_IOU` (default `0.45`)
 - `DEFAULT_IMAGE_SIZE` (default `640`)
 - `DEFAULT_MAX_DETECTIONS` (default `300`)
+- `MODEL_FUSE` (default `1`) to fuse model layers for faster inference
+- `MODEL_HALF` (default `0`) to use FP16 on CUDA devices
 - `MAX_IMAGE_BYTES` (default `10485760`)
 - `IMAGE_FETCH_TIMEOUT` (default `15`)
 - `HEARTBEAT_INTERVAL` (default `10`) to upsert worker status into `inference_workers`
