@@ -78,6 +78,29 @@ Triton (optional):
 python inference_service.py
 ```
 
+## Docker (Jetson)
+1) Create `.env.local` with `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` (plus any optional settings).
+2) Build and start:
+```bash
+docker compose build
+docker compose up -d
+```
+3) Verify:
+```bash
+curl http://localhost:8001/health
+```
+
+Note: Docker uses host networking on Jetson to avoid iptables raw-table issues,
+so the service binds directly to the host at port 8001.
+
+Auto-start on reboot:
+```bash
+sudo systemctl enable --now docker
+```
+
+If you want a different base image, set `BASE_IMAGE` in `docker-compose.yml`
+(default is `nvcr.io/nvidia/pytorch:24.05-py3-igpu`).
+
 ## Endpoints
 - `GET /health` -> service status
 - `GET /models` -> list deployed/deploying runs

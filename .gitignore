@@ -9,3 +9,5 @@ ENV/
 .venv/
 pip-wheel-metadata/
 .pytest_cache/
+.env.local
+models/

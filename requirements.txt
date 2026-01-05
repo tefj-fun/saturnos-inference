@@ -5,4 +5,4 @@ supabase
 python-dotenv
 python-multipart
 pillow
-numpy
+numpy<2
